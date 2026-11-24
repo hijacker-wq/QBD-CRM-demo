@@ -109,6 +109,24 @@
         db.queueNo[key] = Math.max(db.queueNo[key] || 0, a.queue.number);
       }
     }
+    db.leads = {};
+    db.leadOrder = {};
+    for (const k of Object.keys(S)) {
+      const m = k.match(/^\/api\/v1\/leads\/(\d+)$/);
+      if (m) db.leads[m[1]] = get(k).data;
+      const t = k.match(/^\/api\/v1\/leads\?tab=([a-z_]+)/);
+      if (t && S[k].b && S[k].b.data) db.leadOrder[t[1]] = S[k].b.data.map((x) => x.id);
+    }
+    db.leadAssignees = { main: get('/api/v1/leads/assignees?branch=main'), north: get('/api/v1/leads/assignees?branch=north') };
+    for (const b of ['main', 'north']) for (const a of ((db.leadAssignees[b] || {}).data || [])) if (!db.users[a.id]) db.users[a.id] = { id: a.id, display_name: a.display_name };
+    // index of recorded GETs by path, for replay with other query strings
+    db.byPath = {};
+    for (const k of Object.keys(S)) {
+      if (!S[k] || S[k].s >= 400) continue;
+      const p = k.split('?')[0];
+      (db.byPath[p] = db.byPath[p] || []).push(k);
+    }
+    db.rawStatus = (k) => (S[k] ? S[k].s : null);
     db.raw = (k) => get(k);
     db.photo = raw.photo_bytes || {};
     return db;
@@ -135,8 +153,8 @@
       document.body.appendChild(el);
     }
     el.textContent = ar
-      ? 'نسخة تجريبية: الحفظ هنا غير متاح. جرّب المواعيد والمرضى وطلبات الحجز.'
-      : 'Demo version: saving is not available here. Try appointments, patients and booking requests.';
+      ? 'نسخة تجريبية: الحفظ هنا غير متاح. جرّب المواعيد والمرضى وطلبات الحجز والعملاء المحتملين.'
+      : 'Demo version: saving is not available here. Try appointments, patients, booking requests and leads.';
     el.style.display = 'block';
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => { el.style.display = 'none'; }, 4000);
@@ -359,7 +377,7 @@
       .sort((x, y) => (x.starts_at < y.starts_at ? -1 : 1));
     return f.length ? f[0].starts_at : null;
   }
-  const SUMMARY_KEYS = ['id', 'ref', 'branch', 'name', 'phone', 'age_years', 'sex', 'tags', 'status', 'next_appointment_at', 'projection', 'has_alert'];
+  const SUMMARY_KEYS = ['id', 'ref', 'branch', 'name', 'phone', 'phone2', 'age_years', 'sex', 'tags', 'status', 'next_appointment_at', 'projection', 'has_alert'];
   function patientFull(p) {
     p.next_appointment_at = nextAppt(p.id);
     p.has_alert = !!(p.alerts && (p.alerts.allergy === 'reported' || p.alerts.medication === 'reported'));
@@ -386,7 +404,7 @@
     const branch = body.branch || 'main';
     const id = DB.seq.patient++;
     const p = {
-      id, ref: 'PAT-DEMO' + String(id).padStart(4, '0'), branch: clone(DB.branches[branch]), name: body.name, phone: normPhone(body.phone),
+      id, ref: 'PAT-DEMO' + String(id).padStart(4, '0'), branch: clone(DB.branches[branch]), name: body.name, phone: normPhone(body.phone), phone2: normPhone(body.phone2),
       age_years: ageOf(body.birth_date), sex: body.sex || null, tags: tagsFor(body.tag_ids, branch), status: 'active', next_appointment_at: null,
       projection: 'clinical', has_alert: false, birth_date: body.birth_date || null, locale: body.locale || 'ar', contact_method: body.contact_method || 'whatsapp',
       notes: body.notes || null, source: body.source || 'walk_in', origin_reference: null, last_completed_at: null, version: 1,
@@ -530,6 +548,105 @@
     return null;
   }
 
+
+  // ---------- leads ----------
+  const LEAD_ITEM_KEYS = ['id', 'ref', 'status', 'lost_reason', 'branch', 'name', 'phone_last4', 'phone_kind', 'service_key', 'flags', 'source', 'platform', 'campaign_name', 'form', 'assigned_to', 'has_possible_match', 'anonymised', 'received_at', 'received_at_local', 'version'];
+  const TAB_STATUS = { new: ['new'], in_progress: ['contacted'], booked: ['booked', 'converted'], lost: ['lost'] };
+  function leadActions(l) {
+    switch (l.status) {
+      case 'new': return ['mark_contacted', 'mark_lost', 'assign', 'edit_note', 'convert', 'erase'];
+      case 'contacted': return ['mark_lost', 'assign', 'edit_note', 'convert', 'erase'];
+      case 'booked': return ['mark_lost'];
+      case 'lost': return ['reopen'];
+      default: return [];
+    }
+  }
+  function localStamp(iso) {
+    const l = localOf(iso);
+    return { date: l.date, time: l.hm, utc_offset: OFFSET };
+  }
+  function leadDetail(l) { l.allowed_actions = leadActions(l); return clone(l); }
+  function leadItem(l) { const o = {}; for (const k of LEAD_ITEM_KEYS) o[k] = clone(l[k]); return o; }
+  function leadEvent(l, from, to, extra) {
+    const at = nowIso();
+    (l.events = l.events || []).push(Object.assign({ type: 'status_changed', from_status: from, to_status: to, lost_reason: null, assignee: null,
+      actor: me(), occurred_at: at, occurred_at_local: localStamp(at) }, extra || {}));
+    l.version = (l.version || 1) + 1;
+  }
+  function leadList(tab, q) {
+    const order = DB.leadOrder[tab] || DB.leadOrder.all || [];
+    const rank = (id) => { const i = order.indexOf(+id); return i < 0 ? -1 : i; };
+    const sts = TAB_STATUS[tab];
+    q = (q || '').toLowerCase().trim();
+    return Object.values(DB.leads).filter((l) => (!sts || sts.includes(l.status))
+      && (!q || (l.name || '').toLowerCase().includes(q) || (l.ref || '').toLowerCase().includes(q) || (l.phone || '').includes(q) || (l.phone_last4 || '') === q))
+      .sort((a, b) => rank(a.id) - rank(b.id) || (a.received_at < b.received_at ? 1 : -1)).map(leadItem);
+  }
+  function leadsRoutes(m, path, q, body) {
+    let r;
+    if (m === 'GET' && path === '/api/v1/leads/summary') {
+      const out = {};
+      for (const b of ['main', 'north']) out[b] = { branch: b, new: 0, contacted: 0, booked: 0, converted: 0, lost: 0, unassigned_new: 0, assigned_to_me_new: 0, oldest_new_at: null, oldest_new_at_local: null };
+      for (const l of Object.values(DB.leads)) {
+        const e = out[l.branch.code]; if (!e) continue;
+        if (e[l.status] !== undefined) e[l.status]++;
+        if (l.status === 'new') {
+          if (!l.assigned_to) e.unassigned_new++; else if (+l.assigned_to.id === +DB.me.user.id) e.assigned_to_me_new++;
+          if (!e.oldest_new_at || l.received_at < e.oldest_new_at) { e.oldest_new_at = l.received_at; e.oldest_new_at_local = localStamp(l.received_at); }
+        }
+      }
+      return ok(Object.values(out));
+    }
+    if (m === 'GET' && path === '/api/v1/leads/assignees') {
+      const b = q.get('branch') || 'main';
+      return json(200, clone(DB.leadAssignees[b] || DB.leadAssignees.main));
+    }
+    if (m === 'GET' && path === '/api/v1/leads') return ok(leadList(q.get('tab') || 'all'), { next_cursor: null });
+    if (m === 'POST' && path === '/api/v1/leads/search') return ok(leadList(body.tab || 'all', body.q), { next_cursor: null });
+    if ((r = path.match(/^\/api\/v1\/leads\/(\d+)$/)) && m === 'GET') {
+      const l = DB.leads[r[1]];
+      return l ? ok(leadDetail(l)) : err(404, 'not_found');
+    }
+    if ((r = path.match(/^\/api\/v1\/leads\/(\d+)\/(contacted|lost|reopen|assignee|note|convert|erase)$/))) {
+      const l = DB.leads[r[1]];
+      if (!l) return err(404, 'not_found');
+      const op = r[2];
+      if (body.expected_status && body.expected_status !== l.status) return err(409, 'status_conflict', { current_status: l.status });
+      const at = nowIso();
+      if (op === 'contacted') {
+        leadEvent(l, l.status, 'contacted'); l.status = 'contacted';
+        if (!l.first_contacted_at) { l.first_contacted_at = at; l.first_contacted_at_local = localStamp(at); l.first_contacted_by = me(); }
+      } else if (op === 'lost') {
+        if (!body.lost_reason) return err(422, 'validation_failed', { fields: { lost_reason: ['required'] } });
+        leadEvent(l, l.status, 'lost', { lost_reason: body.lost_reason }); l.status = 'lost'; l.lost_reason = body.lost_reason;
+        l.resolved_at = at; l.resolved_at_local = localStamp(at); l.resolved_by = me();
+      } else if (op === 'reopen') {
+        leadEvent(l, 'lost', l.first_contacted_at ? 'contacted' : 'new', { type: 'reopened' });
+        l.status = l.first_contacted_at ? 'contacted' : 'new'; l.lost_reason = null; l.resolved_at = null; l.resolved_at_local = null; l.resolved_by = null;
+      } else if (op === 'assignee') {
+        l.assigned_to = body.user_id ? (DB.users[body.user_id] || null) : null;
+        leadEvent(l, null, null, { type: 'assigned', assignee: l.assigned_to });
+      } else if (op === 'note') {
+        l.internal_note = body.internal_note || null; l.version = (l.version || 1) + 1;
+      } else if (op === 'erase') {
+        return demoOnly();
+      } else if (op === 'convert') {
+        const pb = body.patient || {};
+        let p;
+        if (pb.mode === 'existing') p = DB.patients[pb.patient_id];
+        else p = createPatient({ branch: l.branch.code, name: pb.name || l.name, phone: pb.phone || l.phone, birth_date: pb.birth_date, sex: pb.sex, notes: pb.notes, source: 'meta_lead' });
+        if (!p) return err(404, 'not_found');
+        if (!p.phone) return err(422, 'validation_failed', { fields: { 'patient.phone': ['required'] } });
+        const a = createAppt(Object.assign({ branch: l.branch.code }, body.appointment || {}, { patient_id: p.id }), 'meta_lead');
+        leadEvent(l, l.status, 'booked'); l.status = 'booked';
+        l.booked_at = at; l.booked_at_local = localStamp(at); l.patient_id = p.id; l.appointment_id = a.id;
+        return json(201, { data: { lead: { id: l.id, ref: l.ref, status: 'booked', appointment_id: a.id, patient_id: p.id }, appointment: apptDetail(a), patient: patientFull(p) } });
+      }
+      return ok(leadDetail(l));
+    }
+    return null;
+  }
+
   // ---------- auth ----------
   function authRoutes(m, path, body) {
     if (path === '/api/auth/csrf') return json(200, { csrf_token: 'demo-csrf-token' });
@@ -558,13 +675,47 @@
       const bin = Uint8Array.from(atob(p.b64), (c) => c.charCodeAt(0));
       return new Response(bin, { status: 200, headers: { 'Content-Type': p.ct || 'image/jpeg' } });
     }
-    const keys = [path + (q.toString() ? '?' + q.toString() : ''), path];
-    for (const k of keys) {
-      const v = DB.raw(k);
+    const full = path + (q.toString() ? '?' + q.toString() : '');
+    let v = DB.raw(full);
+    if (v && DB.rawStatus(full) < 400) return json(200, v);
+    const cands = DB.byPath[path] || [];
+    if (cands.length) {
+      // same path, best match on the non-date parameters; a different patient gets the smallest (emptiest) answer
+      const want = {};
+      q.forEach((val, key) => { if (!/^(from|to|date|cursor)$/.test(key)) want[key] = val; });
+      let best = null; let bestScore = -1;
+      for (const k of cands) {
+        const kq = new URLSearchParams(k.split('?')[1] || '');
+        let score = 0; let clash = false;
+        for (const key of Object.keys(want)) {
+          if (kq.get(key) === want[key]) score++;
+          else if (kq.has(key) && /(_id|^id)$/.test(key)) clash = true;
+        }
+        if (!clash && score > bestScore) { best = k; bestScore = score; }
+      }
+      if (!best) {
+        best = cands.slice().sort((a, b) => JSON.stringify(DB.raw(a)).length - JSON.stringify(DB.raw(b)).length)[0];
+      }
+      v = DB.raw(best);
       if (v) return json(200, v);
     }
     if (/^\/api\/v1\/patients\/\d+\/(sheets|packages)$/.test(path)) return ok([], { next_cursor: null });
     if (/^\/api\/v1\/sheets\/\d+\/(photos|history)$/.test(path)) return ok([], { next_cursor: null });
+    return null;
+  }
+
+  function lookupRoutes(m, path, body) {
+    if (m === 'POST' && (path === '/api/v1/pos/invoices/lookup' || path === '/api/v1/finance/invoices/lookup')) {
+      const no = String(body.invoice_no || '').trim().toUpperCase();
+      const base = path.startsWith('/api/v1/pos') ? '/api/v1/pos/invoices/' : '/api/v1/finance/invoices/';
+      for (const k of DB.byPath ? Object.keys(DB.byPath) : []) {
+        if (!k.startsWith(base)) continue;
+        const v = DB.raw(k);
+        const inv = v && v.data && (v.data.invoice_no ? v.data : v.data.invoice);
+        if (inv && String(inv.invoice_no || '').toUpperCase().endsWith(no)) return json(200, v);
+      }
+      return err(404, 'not_found');
+    }
     return null;
   }
 
@@ -578,7 +729,7 @@
     if (bodyText) { try { body = JSON.parse(bodyText); } catch (_) { body = {}; } }
     const m = method.toUpperCase();
     const res = authRoutes(m, path, body) || appointmentsRoutes(m, path, q, body) || patientsRoutes(m, path, q, body)
-      || bookingRoutes(m, path, q, body) || recordedRoutes(m, path, q);
+      || bookingRoutes(m, path, q, body) || leadsRoutes(m, path, q, body) || lookupRoutes(m, path, body) || recordedRoutes(m, path, q);
     if (res) return res;
     if (m !== 'GET') return demoOnly();
     return err(404, 'not_found');

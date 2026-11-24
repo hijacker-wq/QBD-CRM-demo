@@ -1,11 +1,11 @@
 {
-    "name": "Elora Clinic CRM",
+    "name": "Elora Medical Center CRM",
     "short_name": "Elora",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#9A5F4B",
     "theme_color": "#9A5F4B",
-    "description": "Elora Clinic CRM",
+    "description": "Elora Medical Center CRM",
     "orientation": "any",
     "prefer_related_applications": false,
     "icons": [
